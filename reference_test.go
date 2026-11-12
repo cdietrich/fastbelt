@@ -102,3 +102,23 @@ func TestReferenceTypeMismatch(t *testing.T) {
 		t.Fatalf("desc=%v err=%v", ref.Description(), ref.Error())
 	}
 }
+
+// A panic of the getter becomes the reference error (Langium's message), and
+// the reference counts as resolved: the getter does not run again.
+func TestReferenceGetterPanicBecomesError(t *testing.T) {
+	calls := 0
+	owner := &AstNodeBase{}
+	ref := NewReference(owner, NewSyntheticToken("Target", owner), func(ctx context.Context, r *Reference[AstNode]) (*SymbolDescription, *ReferenceError) {
+		calls++
+		panic("bug in a scope")
+	})
+	ref.Resolve(context.Background())
+	ref.Resolve(context.Background())
+	if ref.RefNode(context.Background()) != nil || ref.Description() != nil {
+		t.Fatal("the reference has a target")
+	}
+	want := "An error occurred while resolving reference to 'Target': bug in a scope"
+	if calls != 1 || ref.Error() == nil || ref.Error().Msg != want {
+		t.Fatalf("calls=%d err=%v", calls, ref.Error())
+	}
+}

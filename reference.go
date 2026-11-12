@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log"
 	"reflect"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -183,7 +185,7 @@ func (r *Reference[T]) resolveSlow(ctx context.Context) {
 		// Pop the reference from the chain after resolution
 		chain.refs = chain.refs[:len(chain.refs)-1]
 	}()
-	desc, e := r.getter(ctx, r)
+	desc, e := r.get(ctx)
 	if r.err == nil {
 		// Do not overwrite existing errors
 		r.err = e
@@ -202,6 +204,22 @@ func (r *Reference[T]) resolveSlow(ctx context.Context) {
 	}
 	// Publishing the description marks the reference as resolved; err must be written before this.
 	r.description.Store(desc)
+}
+
+// get runs the getter. A panic of the getter (a bug in a scope provider or
+// linker) does not escape: it is logged and becomes the reference error
+// "An error occurred while resolving reference to '<text>': <panic>", like
+// Langium's linker reports it, and the reference counts as resolved, so the
+// getter is not run again by every later resolution (linking runs in worker
+// goroutines, where an escaping panic would end the process).
+func (r *Reference[T]) get(ctx context.Context) (desc *SymbolDescription, err *ReferenceError) {
+	defer func() {
+		if p := recover(); p != nil {
+			log.Printf("panic while resolving the reference to '%s': %v\n%s", r.Text(), p, debug.Stack())
+			desc, err = nil, NewReferenceError(fmt.Sprintf("An error occurred while resolving reference to '%s': %v", r.Text(), p))
+		}
+	}()
+	return r.getter(ctx, r)
 }
 
 // NewReference creates a lazy, typed reference owned by owner and backed by getter.
