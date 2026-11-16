@@ -6,8 +6,10 @@ package workspace
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"reflect"
+	"runtime/debug"
 	"sync"
 
 	core "typefox.dev/fastbelt"
@@ -112,7 +114,9 @@ func (s *DefaultBuilder) Build(ctx context.Context, docs []*core.Document) error
 	parallel.ForEach(docs, func(doc *core.Document, _ int) {
 		// STEP 1.1: Lex the document and produce tokens.
 		if ctx.Err() == nil && !doc.State().Has(core.DocStateLexed) {
-			lexer.Exec(ctx, doc)
+			guardStep(doc, "lexing", func() { lexer.Exec(ctx, doc) }, func(p any) {
+				doc.LexerErrors = append(doc.LexerErrors, core.NewLexerError(fmt.Sprintf("An error occurred during lexing: %v", p), 0, 0))
+			})
 			if ctx.Err() != nil {
 				s.resetLexed(doc)
 				return
@@ -121,7 +125,9 @@ func (s *DefaultBuilder) Build(ctx context.Context, docs []*core.Document) error
 		}
 		// STEP 1.2: Parse the document and create the AST.
 		if ctx.Err() == nil && !doc.State().Has(core.DocStateParsed) {
-			parser.Parse(ctx, doc)
+			guardStep(doc, "parsing", func() { parser.Parse(ctx, doc) }, func(p any) {
+				doc.ParserErrors = append(doc.ParserErrors, core.NewParserError(fmt.Sprintf("An error occurred during parsing: %v", p), nil))
+			})
 			if ctx.Err() != nil {
 				s.resetParsed(doc)
 				return
@@ -130,7 +136,9 @@ func (s *DefaultBuilder) Build(ctx context.Context, docs []*core.Document) error
 		}
 		// STEP 1.3: Compute the exported symbols for cross-document references.
 		if ctx.Err() == nil && !doc.State().Has(core.DocStateExportedSymbols) {
-			exporter.ExportSymbols(ctx, doc)
+			guardStep(doc, "exporting the symbols of", func() { exporter.ExportSymbols(ctx, doc) }, func(any) {
+				doc.ExportedSymbols = core.EmptySymbolContainer
+			})
 			if ctx.Err() != nil {
 				s.resetExportedSymbols(doc)
 				return
@@ -157,7 +165,9 @@ func (s *DefaultBuilder) Build(ctx context.Context, docs []*core.Document) error
 		// STEP 2.1: Collect imported symbols from all other documents.
 		if ctx.Err() == nil && !doc.State().Has(core.DocStateImportedSymbols) {
 			allDocs := documentManager.All()
-			importer.ImportSymbols(ctx, doc, allDocs)
+			guardStep(doc, "importing the symbols of", func() { importer.ImportSymbols(ctx, doc, allDocs) }, func(any) {
+				doc.ImportedSymbols = core.EmptySymbolContainer
+			})
 			if ctx.Err() != nil {
 				s.resetImportedSymbols(doc)
 				return
@@ -166,7 +176,9 @@ func (s *DefaultBuilder) Build(ctx context.Context, docs []*core.Document) error
 		}
 		// STEP 2.2: Compute the local symbols for intra-document references.
 		if ctx.Err() == nil && !doc.State().Has(core.DocStateLocalSymbols) {
-			localSymbols.LocalSymbols(ctx, doc)
+			guardStep(doc, "computing the local symbols of", func() { localSymbols.LocalSymbols(ctx, doc) }, func(any) {
+				doc.LocalSymbols = linking.NewDefaultLocalSymbols()
+			})
 			if ctx.Err() != nil {
 				s.resetLocalSymbols(doc)
 				return
@@ -190,7 +202,7 @@ func (s *DefaultBuilder) Build(ctx context.Context, docs []*core.Document) error
 	parallel.ForEach(docs, func(doc *core.Document, _ int) {
 		// STEP 3.1: Link the document to resolve all references.
 		if ctx.Err() == nil && !doc.State().Has(core.DocStateLinked) {
-			linker.Link(ctx, doc)
+			guardStep(doc, "linking", func() { linker.Link(ctx, doc) }, nil)
 			if ctx.Err() != nil {
 				s.resetLinking(doc)
 				return
@@ -199,7 +211,7 @@ func (s *DefaultBuilder) Build(ctx context.Context, docs []*core.Document) error
 		}
 		// STEP 3.2: Provide reference descriptions for the document.
 		if ctx.Err() == nil && !doc.State().Has(core.DocStateReferences) {
-			referenceDescriptions.ReferenceDescriptions(ctx, doc)
+			guardStep(doc, "computing the reference descriptions of", func() { referenceDescriptions.ReferenceDescriptions(ctx, doc) }, nil)
 			if ctx.Err() != nil {
 				s.resetReferences(doc)
 				return
@@ -218,7 +230,13 @@ func (s *DefaultBuilder) Build(ctx context.Context, docs []*core.Document) error
 	validator := s.sc.MustGet[DocumentValidator]()
 	parallel.ForEach(docs, func(doc *core.Document, _ int) {
 		if ctx.Err() == nil && !doc.State().Has(core.DocStateValidated) {
-			diagnostics := validator.Validate(ctx, doc)
+			var diagnostics []*core.Diagnostic
+			guardStep(doc, "validating", func() { diagnostics = validator.Validate(ctx, doc) }, func(p any) {
+				source := documentLanguageID(doc)
+				diagnostics = append(CreateLexerDiagnostics(doc, source), CreateParserDiagnostics(doc, source)...)
+				diagnostics = append(diagnostics, &core.Diagnostic{Severity: core.SeverityError,
+					Message: fmt.Sprintf("An error occurred during validation: %v", p), Source: source})
+			})
 			if ctx.Err() != nil {
 				s.resetValidation(doc)
 				return
@@ -342,8 +360,38 @@ func (s *DefaultBuilder) notifyListeners(ctx context.Context, state core.Documen
 		// advanced to this state, so no later build repeats the step, and a
 		// listener skipped here would never be called for it.
 		// Listeners that can afford to skip their work check ctx themselves.
-		if err := listener(ctx, doc); err != nil {
+		if err := callListener(ctx, listener, doc); err != nil {
 			log.Printf("build step listener error (%s): %v", state, err)
 		}
 	}
+}
+
+// callListener calls listener; a panic of the listener is returned as an
+// error, so that it does not stop the other listeners or the build.
+func callListener(ctx context.Context, listener BuildStepListener, doc *core.Document) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+	return listener(ctx, doc)
+}
+
+// guardStep runs a build step of doc. A panic of the step (a bug in a
+// language's service) does not stop the build: it is logged with its stack,
+// and recovered (if not nil) leaves the document as if the step had produced
+// an empty result, e.g. no exported symbols; lexer, parser and validator
+// panics also become errors of the document, like Langium reports them. The
+// document then advances as usual, so that one broken document does not keep
+// the others, or the requests that wait for them, from being built.
+func guardStep(doc *core.Document, step string, run func(), recovered func(p any)) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic while %s %s: %v\n%s", step, documentURI(doc), r, debug.Stack())
+			if recovered != nil {
+				recovered(r)
+			}
+		}
+	}()
+	run()
 }
