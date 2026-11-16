@@ -7,7 +7,9 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"runtime/debug"
 	"slices"
 
 	"golang.org/x/exp/jsonrpc2"
@@ -719,6 +721,21 @@ func (b *DefaultBinder) Bind(ctx context.Context, conn *jsonrpc2.Connection) (js
 		return jsonrpc2.ConnectionOptions{}, err
 	}
 	return jsonrpc2.ConnectionOptions{
-		Handler: lsp.ServerHandler(server),
+		Handler: RecoverHandler(lsp.ServerHandler(server)),
 	}, nil
+}
+
+// RecoverHandler wraps handler so that a panic while handling a message does
+// not end the language server: it logs the panic with its stack trace and
+// answers a request with an internal error.
+func RecoverHandler(handler jsonrpc2.Handler) jsonrpc2.Handler {
+	return jsonrpc2.HandlerFunc(func(ctx context.Context, req *jsonrpc2.Request) (result any, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("panic while handling %q: %v\n%s", req.Method, r, debug.Stack())
+				result, err = nil, fmt.Errorf("%w: %q panicked: %v", jsonrpc2.ErrInternal, req.Method, r)
+			}
+		}()
+		return handler.Handle(ctx, req)
+	})
 }

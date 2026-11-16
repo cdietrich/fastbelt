@@ -6,6 +6,9 @@ package workspace
 
 import (
 	"context"
+	"fmt"
+	"log"
+	"runtime/debug"
 
 	core "typefox.dev/fastbelt"
 	"typefox.dev/fastbelt/util/service"
@@ -52,15 +55,63 @@ func (s *DefaultDocumentValidator) Validate(ctx context.Context, doc *core.Docum
 		}
 		diagnostics = append(diagnostics, d)
 	}
+	// A panic of a validator (a bug in a check, or in a scope provider it
+	// resolves a reference with) does not end the validation: it is logged
+	// and reported as an error on the node, and the nodes after it are still
+	// validated, like Langium reports a failing check. Only a panic pays for
+	// the recovery: validateNodes is restarted after the failing node.
+	for skip := 0; skip >= 0; {
+		skip = s.validateNodes(ctx, doc, skip, accept)
+	}
+	return diagnostics
+}
+
+// validateNodes runs the validators of the nodes of doc, skipping the first
+// skip of them. It returns -1 when it is done, or, after a validator
+// panicked, the number of validators to skip to continue after it.
+func (s *DefaultDocumentValidator) validateNodes(ctx context.Context, doc *core.Document, skip int, accept core.ValidationAcceptor) (next int) {
+	i := 0
+	// current is the node whose validator runs, nil while walking the tree.
+	var current core.AstNode
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		node := current
+		next = i + 1
+		if node == nil {
+			// The walk itself failed: report it on the root and stop, as
+			// a restart would fail at the same place.
+			node = doc.Root
+			next = -1
+		}
+		log.Printf("panic in the validation of a %T in %s: %v\n%s", node, documentURI(doc), r, debug.Stack())
+		accept(core.NewDiagnostic(core.SeverityError, fmt.Sprintf("An error occurred during validation: %v", r), node))
+	}()
 	for node := range core.AllNodes(doc.Root) {
 		if ctx.Err() != nil {
 			break
 		}
-		if validator, ok := node.(core.Validator); ok {
-			validator.Validate(ctx, s.sc, accept)
+		validator, ok := node.(core.Validator)
+		if !ok {
+			continue
 		}
+		if i >= skip {
+			current = node
+			validator.Validate(ctx, s.sc, accept)
+			current = nil
+		}
+		i++
 	}
-	return diagnostics
+	return -1
+}
+
+func documentURI(doc *core.Document) string {
+	if doc.URI != nil {
+		return doc.URI.String()
+	}
+	return "<no uri>"
 }
 
 func documentLanguageID(doc *core.Document) string {
