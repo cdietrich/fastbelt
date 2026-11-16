@@ -181,7 +181,7 @@ func appendQuoted(buf []byte, s string) []byte {
 	return append(buf, s...)
 }
 
-var errNotInitialized = errors.New("the client has not initialized the server")
+var errNoClient = errors.New("no initialized connection to the client")
 
 // send sends msg to the client, once the client has initialized the server.
 func (h *SlogHandler) send(ctx context.Context, level lsp.MessageType, msg string) error {
@@ -190,7 +190,7 @@ func (h *SlogHandler) send(ctx context.Context, level lsp.MessageType, msg strin
 		return err
 	}
 	if !conn.Initialized() || conn.Value == nil {
-		return errNotInitialized
+		return errNoClient
 	}
 	lspConn := lsp.ClientDispatcher(conn.Value)
 	return lspConn.LogMessage(ctx, &lsp.LogMessageParams{

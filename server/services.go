@@ -22,16 +22,23 @@ type WorkspaceFolders struct {
 // It is assigned by [DefaultBinder.Bind] when the language server is started.
 type Connection struct {
 	Value *jsonrpc2.Connection
-	// initialized is set by [DefaultLanguageServer.Initialize].
+	// initialized is set by SetInitialized.
 	initialized atomic.Bool
 }
 
 // Initialized reports whether the client has sent the initialize request.
-// Before that, the server must not send messages to the client. Value is
-// only read after Initialized returned true, which orders the read after
-// its assignment by the binder.
+// Before that, the server must not send messages to the client, e.g. log
+// messages ([SlogHandler]). Read Value only after Initialized returned true,
+// which orders the read after its assignment by the binder.
 func (c *Connection) Initialized() bool {
 	return c.initialized.Load()
+}
+
+// SetInitialized records that the client has sent the initialize request.
+// [DefaultLanguageServer.Initialize] calls it; an [lsp.Server] that handles
+// initialize itself, without delegating to it, must call it too.
+func (c *Connection) SetInitialized() {
+	c.initialized.Store(true)
 }
 
 // SetupDefaultServices sets up the default services for the language server.

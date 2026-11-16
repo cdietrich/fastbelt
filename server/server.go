@@ -86,7 +86,7 @@ func NewDefaultLanguageServer(sc *service.Container) lsp.Server {
 func (s *DefaultLanguageServer) Initialize(ctx context.Context, params *lsp.ParamInitialize) (*lsp.InitializeResult, error) {
 	// From now on, messages may be sent to the client, e.g. log messages.
 	if connection, err := s.sc.Get[*Connection](); err == nil {
-		connection.initialized.Store(true)
+		connection.SetInitialized()
 	}
 	// Initialize all participants first
 	for service := range s.sc.GetAll[InitializeParticipant]() {

@@ -76,7 +76,7 @@ func TestSlogHandlerFallsBackBeforeInitialize(t *testing.T) {
 
 	// Initialized, but without a connection: still the fallback.
 	out.Reset()
-	connection.initialized.Store(true)
+	connection.SetInitialized()
 	assert.True(t, connection.Initialized())
 	r.Time = time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	require.NoError(t, derived.Handle(context.Background(), r))
