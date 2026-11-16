@@ -6,10 +6,16 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"unicode"
 
 	"typefox.dev/fastbelt/util/service"
@@ -22,6 +28,11 @@ import (
 // the attributes of groups are qualified with the group names, e.g.
 // "build.documents=42".
 //
+// Until the client has sent the initialize request, and whenever a record
+// cannot be sent (no connection, or the connection is closed), the record is
+// written to stderr instead, so that startup errors stay visible and nothing
+// is sent before initialize, as the LSP specification requires.
+//
 // The handler does not make itself the process-wide default logger; call
 // [SetDefaultLogger] from the server's main to send the output of the
 // [slog] and [log] packages to the client.
@@ -33,7 +44,20 @@ type SlogHandler struct {
 	prefix string
 	// attrs holds the attributes of WithAttrs, formatted as " key=value".
 	attrs []byte
+	// state is shared with the handlers derived by WithAttrs and WithGroup.
+	state *slogHandlerState
 }
+
+type slogHandlerState struct {
+	// initialized is set by OnServerInitialize. It also orders the reads of
+	// the connection after its assignment by the binder.
+	initialized atomic.Bool
+	// fallback receives the records that are not sent to the client.
+	fallback   io.Writer
+	fallbackMu sync.Mutex
+}
+
+var _ InitializeParticipant = (*SlogHandler)(nil)
 
 // SlogHandlerOptions are the options of a [SlogHandler].
 type SlogHandlerOptions struct {
@@ -55,16 +79,22 @@ func NewSlogHandlerWithOptions(sc *service.Container, options SlogHandlerOptions
 	if level == nil {
 		level = slog.LevelInfo
 	}
-	return &SlogHandler{sc: sc, level: level}
+	return &SlogHandler{sc: sc, level: level, state: &slogHandlerState{fallback: os.Stderr}}
 }
 
 // SetDefaultLogger makes the [slog.Handler] registered in sc, by default a
 // [SlogHandler], the handler of the process-wide default logger, so that the
-// output of the [slog] and [log] packages is sent to the LSP client. Call it
-// from the server's main, after the container is sealed; output before the
-// client is connected is dropped.
+// output of the [slog] and [log] packages is sent to the LSP client (until
+// the client has initialized the server, to stderr). Call it from the
+// server's main, after the container is sealed.
 func SetDefaultLogger(sc *service.Container) {
 	slog.SetDefault(slog.New(sc.MustGet[slog.Handler]()))
+}
+
+// OnServerInitialize implements [InitializeParticipant]: from now on, records
+// are sent to the client.
+func (h *SlogHandler) OnServerInitialize(_ *lsp.ParamInitialize) {
+	h.state.initialized.Store(true)
 }
 
 func (h *SlogHandler) Enabled(_ context.Context, level slog.Level) bool {
@@ -72,18 +102,27 @@ func (h *SlogHandler) Enabled(_ context.Context, level slog.Level) bool {
 }
 
 func (h *SlogHandler) Handle(ctx context.Context, record slog.Record) error {
-	var lspLevel lsp.MessageType
-	switch {
-	case record.Level < slog.LevelInfo:
-		lspLevel = lsp.Log
-	case record.Level < slog.LevelWarn:
-		lspLevel = lsp.Info
-	case record.Level < slog.LevelError:
-		lspLevel = lsp.Warning
-	default:
-		lspLevel = lsp.Error
+	msg := h.message(record)
+	if h.state.initialized.Load() {
+		if err := h.send(ctx, messageType(record.Level), msg); err == nil {
+			return nil
+		}
 	}
-	return h.write(ctx, lspLevel, h.message(record))
+	return h.writeFallback(record, msg)
+}
+
+// messageType returns the LSP message type of a record level.
+func messageType(level slog.Level) lsp.MessageType {
+	switch {
+	case level < slog.LevelInfo:
+		return lsp.Log
+	case level < slog.LevelWarn:
+		return lsp.Info
+	case level < slog.LevelError:
+		return lsp.Warning
+	default:
+		return lsp.Error
+	}
 }
 
 // message returns the text sent for record: its message and attributes.
@@ -138,35 +177,49 @@ func appendAttr(buf []byte, prefix string, attr slog.Attr) []byte {
 		return buf
 	}
 	buf = append(buf, ' ')
-	buf = append(buf, prefix...)
-	buf = append(buf, attr.Key...)
+	buf = appendQuoted(buf, prefix+attr.Key)
 	buf = append(buf, '=')
-	value := attr.Value.String()
-	if needsQuoting(value) {
-		return strconv.AppendQuote(buf, value)
-	}
-	return append(buf, value...)
+	return appendQuoted(buf, attr.Value.String())
 }
 
-// needsQuoting reports whether value must be quoted to be read back as one
-// value: if it is empty or contains spaces, '=', '"' or unprintable runes.
-func needsQuoting(value string) bool {
-	return value == "" || strings.IndexFunc(value, func(r rune) bool {
+// appendQuoted appends s to buf, quoted if it is empty or contains spaces,
+// '=', '"' or unprintable runes, so that keys and values can be told apart.
+func appendQuoted(buf []byte, s string) []byte {
+	if s == "" || strings.IndexFunc(s, func(r rune) bool {
 		return unicode.IsSpace(r) || r == '=' || r == '"' || !unicode.IsPrint(r)
-	}) >= 0
+	}) >= 0 {
+		return strconv.AppendQuote(buf, s)
+	}
+	return append(buf, s...)
 }
 
-func (h *SlogHandler) write(ctx context.Context, level lsp.MessageType, msg string) error {
+var errNoConnection = errors.New("no connection to the client")
+
+// send sends msg to the client.
+func (h *SlogHandler) send(ctx context.Context, level lsp.MessageType, msg string) error {
 	conn, err := h.sc.Get[*Connection]()
 	if err != nil {
 		return err
 	}
 	if conn.Value == nil {
-		return nil // Connection not established; skip logging
+		return errNoConnection
 	}
 	lspConn := lsp.ClientDispatcher(conn.Value)
 	return lspConn.LogMessage(ctx, &lsp.LogMessageParams{
 		Type:    level,
 		Message: msg,
 	})
+}
+
+// writeFallback writes record, formatted as msg, as one line to the fallback
+// writer: time (if set), level and message.
+func (h *SlogHandler) writeFallback(record slog.Record, msg string) error {
+	prefix := record.Level.String()
+	if !record.Time.IsZero() {
+		prefix = record.Time.Format("2006/01/02 15:04:05") + " " + prefix
+	}
+	h.state.fallbackMu.Lock()
+	defer h.state.fallbackMu.Unlock()
+	_, err := fmt.Fprintf(h.state.fallback, "%s %s\n", prefix, msg)
+	return err
 }

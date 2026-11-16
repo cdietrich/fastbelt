@@ -5,13 +5,16 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"typefox.dev/fastbelt/util/service"
+	"typefox.dev/lsp"
 )
 
 func record(msg string, attrs ...slog.Attr) slog.Record {
@@ -49,7 +52,45 @@ func TestSlogHandlerLevel(t *testing.T) {
 
 // Initializing a server does not change the process-wide default logger.
 func TestSlogHandlerIsNotTheDefaultLogger(t *testing.T) {
-	h := NewSlogHandler(service.NewContainer())
-	_, participates := h.(InitializeParticipant)
-	assert.False(t, participates)
+	before := slog.Default()
+	NewSlogHandler(service.NewContainer()).(InitializeParticipant).OnServerInitialize(&lsp.ParamInitialize{})
+	assert.Same(t, before, slog.Default())
+}
+
+// Until the client has initialized the server, and while there is no
+// connection, records are written to the fallback (stderr) instead of being
+// dropped; handlers derived with WithAttrs share that state.
+func TestSlogHandlerFallsBackBeforeInitialize(t *testing.T) {
+	sc := service.NewContainer()
+	sc.Put(&Connection{})
+	sc.Seal()
+	h := NewSlogHandler(sc).(*SlogHandler)
+	var out bytes.Buffer
+	h.state.fallback = &out
+	derived := h.WithAttrs([]slog.Attr{slog.String("server", "x")})
+
+	r := record("cannot start", slog.String("reason", "no port"))
+	require.NoError(t, derived.Handle(context.Background(), r))
+	assert.Equal(t, "INFO cannot start server=x reason=\"no port\"\n", out.String())
+
+	// Initialized, but without a connection: still the fallback.
+	out.Reset()
+	h.OnServerInitialize(&lsp.ParamInitialize{})
+	r.Time = time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, derived.Handle(context.Background(), r))
+	assert.Equal(t, "2026/11/16 12:00:00 INFO cannot start server=x reason=\"no port\"\n", out.String())
+}
+
+// Keys that could not be told apart from their values are quoted.
+func TestSlogHandlerQuotesKeys(t *testing.T) {
+	h := NewSlogHandler(service.NewContainer()).(*SlogHandler)
+	assert.Equal(t, `built "a b"=1 "x=y"=2`, h.message(record("built", slog.Int("a b", 1), slog.Int("x=y", 2))))
+}
+
+func TestSlogHandlerMessageTypes(t *testing.T) {
+	assert.Equal(t, lsp.Log, messageType(slog.LevelDebug))
+	assert.Equal(t, lsp.Info, messageType(slog.LevelInfo))
+	assert.Equal(t, lsp.Warning, messageType(slog.LevelWarn))
+	assert.Equal(t, lsp.Error, messageType(slog.LevelError))
+	assert.Equal(t, lsp.Error, messageType(slog.LevelError+4))
 }
