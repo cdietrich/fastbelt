@@ -91,6 +91,13 @@ func (s *DefaultLanguageServer) Initialize(ctx context.Context, params *lsp.Para
 		return nil, err
 	}
 	workspaceFolders.Value = params.WorkspaceFolders
+	var workspaceOptions *lsp.WorkspaceOptions
+	if contentProvider, err := s.sc.Get[TextDocumentContentProvider](); err == nil {
+		content := lsp.WorkspaceOptionsTextDocumentContentFromTextDocumentContentOptions(lsp.TextDocumentContentOptions{
+			Schemes: contentProvider.Schemes(),
+		})
+		workspaceOptions = &lsp.WorkspaceOptions{TextDocumentContent: &content}
+	}
 	completionOptions := optionsIf[CompletionProvider, lsp.CompletionOptions](s.sc)
 	if completionOptions != nil {
 		if triggers, err := s.sc.Get[CompletionTriggers](); err == nil && triggers != nil {
@@ -115,6 +122,7 @@ func (s *DefaultLanguageServer) Initialize(ctx context.Context, params *lsp.Para
 	return &lsp.InitializeResult{
 		Capabilities: lsp.ServerCapabilities{
 			PositionEncoding: &positionEncoding,
+			Workspace:        workspaceOptions,
 			TextDocumentSync: &lsp.TextDocumentSyncOptions{
 				OpenClose:         true,
 				WillSave:          true,
@@ -563,7 +571,9 @@ func (s *DefaultLanguageServer) Symbol(ctx context.Context, params *lsp.Workspac
 	})
 }
 func (s *DefaultLanguageServer) TextDocumentContent(ctx context.Context, params *lsp.TextDocumentContentParams) (*lsp.TextDocumentContentResult, error) {
-	return nil, nil
+	return dispatchRead(s.sc, ctx, params.URI, true, func(ctx context.Context, p TextDocumentContentProvider) (*lsp.TextDocumentContentResult, error) {
+		return p.HandleTextDocumentContentRequest(ctx, params)
+	})
 }
 func (s *DefaultLanguageServer) WillCreateFiles(ctx context.Context, params *lsp.CreateFilesParams) (*lsp.WorkspaceEdit, error) {
 	return nil, nil
