@@ -15,16 +15,21 @@ import (
 )
 
 // DocumentUpdater applies text-document changes to the workspace and triggers
-// rebuilds. It sits between the LSP document sync layer and [Builder],
-// serializing mutations through [Lock.Write] and cancelling in-progress builds
-// when new changes arrive.
+// rebuilds. It sits between the LSP document sync layer and [Builder].
 //
-// All methods are safe for concurrent use.
+// The updater does not acquire the [Lock] itself: callers serialize updates
+// by calling it from within a [Lock.Write] task, which also cancels
+// in-progress builds when new changes arrive.
 type DocumentUpdater interface {
 	// Update creates or updates [core.Document] values for changed handles,
-	// removes deleted URIs from [DocumentManager], and starts a new build.
-	// It returns immediately; the build runs asynchronously in a background
-	// goroutine. Any in-progress build is cancelled before the new one starts.
+	// removes deleted URIs from [DocumentManager], and rebuilds the workspace.
+	// It runs synchronously and returns once the build has finished or ctx
+	// was cancelled.
+	//
+	// Update must be called under [Lock.Write], with the context passed to
+	// the write task as ctx. The document mutations are always applied; only
+	// the build is cut short when ctx is cancelled by a newer write, and that
+	// write is then responsible for building the documents left incomplete.
 	Update(ctx context.Context, changed []textdoc.Handle, deleted []core.URI)
 }
 
@@ -34,61 +39,80 @@ type DefaultDocumentUpdater struct {
 }
 
 // NewDefaultDocumentUpdater returns a [DocumentUpdater] that coordinates
-// [DocumentManager], [Builder], and [Lock].
+// [DocumentManager], [DocumentChangeImpact], and [Builder].
 func NewDefaultDocumentUpdater(sc *service.Container) DocumentUpdater {
 	return &DefaultDocumentUpdater{sc: sc}
 }
 
-func (s *DefaultDocumentUpdater) Update(_ context.Context, changed []textdoc.Handle, deleted []core.URI) {
-	go func() {
-		docManager := s.sc.MustGet[DocumentManager]()
-		changeImpact := s.sc.MustGet[DocumentChangeImpact]()
-		builder := s.sc.MustGet[Builder]()
-		lock := s.sc.MustGet[Lock]()
-		// Write cancels any previous pending or in-progress build and issues a
-		// fresh context. The outer ctx is from jsonrpc2 and has a different
-		// lifetime than the build.
-		lock.Write(context.Background(), func(ctx context.Context) {
-			changedURIs := make(collections.Set[string], len(changed)+len(deleted))
-			for _, handle := range changed {
-				doc := core.NewDocument(handle)
-				docManager.Set(doc)
-				changedURIs.Add(doc.URI.StringUnencoded())
-			}
-			for _, uri := range deleted {
-				docManager.Delete(uri)
-				changedURIs.Add(uri.StringUnencoded())
-			}
+func (s *DefaultDocumentUpdater) Update(ctx context.Context, changed []textdoc.Handle, deleted []core.URI) {
+	docManager := s.sc.MustGet[DocumentManager]()
+	changeImpact := s.sc.MustGet[DocumentChangeImpact]()
+	builder := s.sc.MustGet[Builder]()
+	// The caller holds the write lock, so this is the mutation phase: documents
+	// may be replaced, deleted, and reset until the build starts below.
+	changedURIs := make(collections.Set[string], len(changed)+len(deleted))
+	for _, handle := range changed {
+		doc := core.NewDocument(handle)
+		docManager.Set(doc)
+		changedURIs.Add(doc.URI.StringUnencoded())
+	}
+	for _, uri := range deleted {
+		docManager.Delete(uri)
+		changedURIs.Add(uri.StringUnencoded())
+	}
 
-			// Reset documents that depend on a changed document so their references
-			// are resolved again, then collect every document that has not yet
-			// completed all build phases. This covers the changed documents, the
-			// documents reset above, documents left incomplete by a previously
-			// cancelled build, and documents that have not been built at all
-			// (e.g. after the initial workspace load). Relinked documents keep
-			// their parsed AST, exported symbols, and local symbols because the
-			// documents themselves did not change.
-			keepState := core.DocStateLexed |
-				core.DocStateParsed |
-				core.DocStateExportedSymbols |
-				core.DocStateLocalSymbols
-			docs := make([]*core.Document, 0, len(changed)+10)
-			for doc := range docManager.All() {
-				if !changedURIs.Has(doc.URI.StringUnencoded()) && changeImpact.Affected(doc, changedURIs) {
-					builder.Reset(doc, keepState)
-				}
-				if !doc.State().IsComplete() {
-					docs = append(docs, doc)
-				}
-			}
+	// Reset documents that depend on a changed document so their references
+	// are resolved again, then collect every document that has not yet
+	// completed all build phases. This covers the changed documents, the
+	// documents reset above, documents left incomplete by a previously
+	// cancelled build, and documents that have not been built at all
+	// (e.g. after the initial workspace load). Relinked documents keep
+	// their parsed AST, exported symbols, and local symbols because the
+	// documents themselves did not change.
+	keepState := core.DocStateLexed |
+		core.DocStateParsed |
+		core.DocStateExportedSymbols |
+		core.DocStateLocalSymbols
+	docs := make([]*core.Document, 0, len(changed)+10)
+	for doc := range docManager.All() {
+		if !changedURIs.Has(doc.URI.StringUnencoded()) && changeImpact.Affected(doc, changedURIs) {
+			builder.Reset(doc, keepState)
+		}
+		if !doc.State().IsComplete() {
+			docs = append(docs, doc)
+		}
+	}
 
-			if err := builder.Build(ctx, docs); err != nil {
-				if ctx.Err() == nil {
-					log.Printf("build failed: %v", err)
-				}
-			}
-		})
-	}()
+	if err := builder.Build(ctx, docs); err != nil {
+		if ctx.Err() == nil {
+			log.Printf("build failed: %v", err)
+		}
+	}
+}
+
+// UpdateInLock is a utility function to call the [DocumentUpdater.Update] method within the
+// [Lock.Write] context. Both services are retrieved from the supplied service container.
+// The function calls apply within a locked write context and returns as soon as the update starts.
+// This will run the workspace update concurrently without blocking the language server for any
+// incoming notifications or updates.
+// If a notify function is returned from apply, it will be called right after the function returns.
+//
+// The update will be cancelled if the specified context is cancelled.
+func UpdateInLock(ctx context.Context, sc *service.Container, apply func(ctx context.Context) (changed []textdoc.Handle, deleted []core.URI, notify func())) {
+	lock := sc.MustGet[Lock]()
+	applied := make(chan struct{})
+	go lock.Write(ctx, func(writeCtx context.Context) {
+		changed, deleted, notify := func() ([]textdoc.Handle, []core.URI, func()) {
+			defer close(applied)
+			return apply(writeCtx)
+		}()
+		if notify != nil {
+			notify()
+		}
+		updater := sc.MustGet[DocumentUpdater]()
+		updater.Update(writeCtx, changed, deleted)
+	})
+	<-applied
 }
 
 // DocumentChangeImpact reports whether a document should be relinked in response

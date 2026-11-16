@@ -30,7 +30,17 @@ type TextDocumentWillSaveEvent struct {
 
 // TextDocumentChangeHandler is called when a document changes.
 // Handlers are invoked synchronously in the order they were registered.
-// If a handler blocks, it will delay subsequent handlers and the notification response.
+//
+// Handlers for didOpen, didChange, and didClose run while the
+// [workspace.Lock] is held for writing, before the workspace is rebuilt. They
+// may access the workspace directly but must not acquire the lock themselves,
+// which would deadlock. Their ctx is the write's context: it is cancelled as
+// soon as a newer write arrives, which can be before the handler starts.
+// Work that must not be skipped, such as notifying the client, should
+// detach from it with [context.WithoutCancel]. A handler that blocks delays
+// subsequent handlers, the rebuild, and every later write and read.
+//
+// Handlers for didSave run without the lock.
 type TextDocumentChangeHandler func(ctx context.Context, event *TextDocumentChangeEvent)
 
 // TextDocumentWillSaveHandler is called when a document will be saved.
@@ -42,6 +52,17 @@ type TextDocumentWillSaveHandler func(ctx context.Context, event *TextDocumentWi
 type TextDocumentWillSaveWaitUntilHandler func(ctx context.Context, event *TextDocumentWillSaveEvent) ([]lsp.TextEdit, error)
 
 // DocumentSynchronizer is a service for handling LSP text document synchronization notifications.
+//
+// DidOpen, DidChange, and DidClose each apply their change to the
+// [textdoc.Store] while holding the [workspace.Lock] for writing, so readers
+// never observe a text change without the matching workspace reset. They
+// return once the text change has been applied, which requires the running
+// write to finish and all readers to drain; the registered handlers (for
+// DidOpen and DidChange) and the rebuild through [workspace.DocumentUpdater]
+// continue in the background under the same write. Changes take effect in the
+// order the notifications were received. Every write ends with a rebuild,
+// including DidClose and notifications that leave the text unchanged, because
+// acquiring the write lock cancels the build that was running.
 //
 // Thread Safety: All methods are safe for concurrent use.
 type DocumentSynchronizer interface {
@@ -77,34 +98,41 @@ func NewDefaultDocumentSynchronizer(sc *service.Container) DocumentSynchronizer 
 	return &DefaultDocumentSynchronizer{sc: sc}
 }
 
-func (s *DefaultDocumentSynchronizer) DidOpen(ctx context.Context, params *lsp.DidOpenTextDocumentParams) {
-	textdocStore := s.sc.MustGet[textdoc.Store]()
-	uri := core.NormalizeURI(params.TextDocument.URI)
-	existing := textdocStore.Get(uri)
-
-	doc := textdoc.NewOverlay(
-		uri,
-		string(params.TextDocument.LanguageID),
-		params.TextDocument.Version,
-		params.TextDocument.Text,
-	)
-
-	textdocStore.AddOverlay(doc)
+// notify calls the handlers with a change event for doc. handlers points to
+// one of the handler lists of s, which is read under s.mu.
+func (s *DefaultDocumentSynchronizer) notify(ctx context.Context, handlers *[]TextDocumentChangeHandler, doc *textdoc.Overlay) {
 	s.mu.RLock()
-	for _, handler := range s.didOpenHandlers {
+	defer s.mu.RUnlock()
+	for _, handler := range *handlers {
 		handler(ctx, &TextDocumentChangeEvent{Document: doc})
 	}
-	s.mu.RUnlock()
-	if existing != nil && existing.Text(nil) == params.TextDocument.Text && existing.LanguageID() == doc.LanguageID() {
-		// The text editor content and language are the same as the file's.
-		// Nothing changed, don't start another workspace build.
-		// Note: Language clients will send didClose+didOpen with a different
-		// language ID if the user changes it - this will correctly generate
-		// a new document and start a new build.
-		return
-	}
-	updater := s.sc.MustGet[workspace.DocumentUpdater]()
-	updater.Update(ctx, []textdoc.Handle{doc}, nil)
+}
+
+func (s *DefaultDocumentSynchronizer) DidOpen(ctx context.Context, params *lsp.DidOpenTextDocumentParams) {
+	workspace.UpdateInLock(context.Background(), s.sc, func(writeCtx context.Context) ([]textdoc.Handle, []core.URI, func()) {
+		textdocStore := s.sc.MustGet[textdoc.Store]()
+		uri := core.NormalizeURI(params.TextDocument.URI)
+		existing := textdocStore.Get(uri)
+
+		doc := textdoc.NewOverlay(
+			uri,
+			string(params.TextDocument.LanguageID),
+			params.TextDocument.Version,
+			params.TextDocument.Text,
+		)
+		textdocStore.AddOverlay(doc)
+
+		notify := func() { s.notify(writeCtx, &s.didOpenHandlers, doc) }
+		if existing != nil && existing.Text(nil) == params.TextDocument.Text && existing.LanguageID() == doc.LanguageID() {
+			// The text editor content and language are the same as the file's.
+			// Nothing changed, keep the document that is already built.
+			// Note: Language clients will send didClose+didOpen with a different
+			// language ID if the user changes it - this will correctly generate
+			// a new document and start a new build.
+			return nil, nil, notify
+		}
+		return []textdoc.Handle{doc}, nil, notify
+	})
 }
 
 func (s *DefaultDocumentSynchronizer) OnDidOpen(handler TextDocumentChangeHandler) {
@@ -117,33 +145,27 @@ func (s *DefaultDocumentSynchronizer) DidChange(ctx context.Context, params *lsp
 	if len(params.ContentChanges) == 0 {
 		return
 	}
+	workspace.UpdateInLock(context.Background(), s.sc, func(writeCtx context.Context) ([]textdoc.Handle, []core.URI, func()) {
+		textdocStore := s.sc.MustGet[textdoc.Store]()
+		uri := core.NormalizeURI(params.TextDocument.URI)
+		doc := textdocStore.GetOverlay(uri)
+		if doc == nil {
+			return nil, nil, nil
+		}
 
-	textdocStore := s.sc.MustGet[textdoc.Store]()
-	uri := core.NormalizeURI(params.TextDocument.URI)
-	doc := textdocStore.GetOverlay(uri)
-	if doc == nil {
-		return
-	}
-
-	oldContent := doc.Content()
-
-	if err := doc.Update(params.ContentChanges, params.TextDocument.Version); err != nil {
-		// Log error but continue - this is a notification, not a request
-		log.Printf("failed to update document: %v", err)
-		return
-	}
-
-	if bytes.Equal(oldContent, doc.Content()) {
-		// Document hasn't actually changed, no need to notify handlers or update the workspace
-		return
-	}
-	s.mu.RLock()
-	for _, handler := range s.didChangeHandlers {
-		handler(ctx, &TextDocumentChangeEvent{Document: doc})
-	}
-	s.mu.RUnlock()
-	updater := s.sc.MustGet[workspace.DocumentUpdater]()
-	updater.Update(ctx, []textdoc.Handle{doc}, nil)
+		oldContent := doc.Content()
+		if err := doc.Update(params.ContentChanges, params.TextDocument.Version); err != nil {
+			// Log the error and carry on - this is a notification, not a request
+			// Note: At this point, client and server are desynchronized - but the client is at fault here
+			log.Printf("failed to update document: %v", err)
+			return nil, nil, nil
+		}
+		if bytes.Equal(oldContent, doc.Content()) {
+			// Document hasn't actually changed, no need to notify handlers
+			return nil, nil, nil
+		}
+		return []textdoc.Handle{doc}, nil, func() { s.notify(writeCtx, &s.didChangeHandlers, doc) }
+	})
 }
 
 func (s *DefaultDocumentSynchronizer) OnDidChange(handler TextDocumentChangeHandler) {
@@ -153,17 +175,19 @@ func (s *DefaultDocumentSynchronizer) OnDidChange(handler TextDocumentChangeHand
 }
 
 func (s *DefaultDocumentSynchronizer) DidClose(ctx context.Context, params *lsp.DidCloseTextDocumentParams) {
-	textdocStore := s.sc.MustGet[textdoc.Store]()
-	uri := core.NormalizeURI(params.TextDocument.URI)
-	existing := textdocStore.GetOverlay(uri)
-	if existing != nil {
-		s.mu.Lock()
-		for _, handler := range s.didCloseHandlers {
-			handler(ctx, &TextDocumentChangeEvent{Document: existing})
+	workspace.UpdateInLock(context.Background(), s.sc, func(writeCtx context.Context) ([]textdoc.Handle, []core.URI, func()) {
+		textdocStore := s.sc.MustGet[textdoc.Store]()
+		uri := core.NormalizeURI(params.TextDocument.URI)
+		// The handlers run before the overlay is removed, so the notification
+		// waits for them.
+		if existing := textdocStore.GetOverlay(uri); existing != nil {
+			s.notify(writeCtx, &s.didCloseHandlers, existing)
 		}
-		s.mu.Unlock()
-	}
-	textdocStore.RemoveOverlay(uri)
+		textdocStore.RemoveOverlay(uri)
+		// TODO: Maybe do some more work here - a closed document could no longer exist.
+		// see also https://github.com/eclipse-fastbelt/fastbelt/issues/185
+		return nil, nil, nil
+	})
 }
 
 func (s *DefaultDocumentSynchronizer) OnDidClose(handler TextDocumentChangeHandler) {
