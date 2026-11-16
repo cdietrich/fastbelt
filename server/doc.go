@@ -24,7 +24,8 @@
 // beforehand. Other features, such as semantic tokens or code actions, are
 // not registered by default; register an implementation to enable them
 // ([TokenBasedSemanticTokensProvider] is a ready-made one for semantic
-// tokens). Services that need to inspect the client's initialize request
+// tokens, [NewDefaultTextDocumentContentProvider] one for the content of
+// documents with URI schemes the client cannot read, e.g. built-in libraries). Services that need to inspect the client's initialize request
 // implement [InitializeParticipant].
 //
 // # Shared name and reference lookup
