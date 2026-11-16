@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"unicode"
 
 	"typefox.dev/fastbelt/util/service"
@@ -28,10 +27,12 @@ import (
 // the attributes of groups are qualified with the group names, e.g.
 // "build.documents=42".
 //
-// Until the client has sent the initialize request, and whenever a record
-// cannot be sent (no connection, or the connection is closed), the record is
-// written to stderr instead, so that startup errors stay visible and nothing
-// is sent before initialize, as the LSP specification requires.
+// Until the client has sent the initialize request ([Connection.Initialized]),
+// and whenever a record cannot be sent (no connection, or the connection is
+// closed), the record is written to stderr instead, so that startup errors
+// stay visible and nothing is sent before initialize, as the LSP
+// specification requires. Every handler of the same container, also one
+// wrapped by another handler, switches to the client at initialize.
 //
 // The handler does not make itself the process-wide default logger; call
 // [SetDefaultLogger] from the server's main to send the output of the
@@ -44,20 +45,15 @@ type SlogHandler struct {
 	prefix string
 	// attrs holds the attributes of WithAttrs, formatted as " key=value".
 	attrs []byte
-	// state is shared with the handlers derived by WithAttrs and WithGroup.
-	state *slogHandlerState
+	// fallback is shared with the handlers derived by WithAttrs and WithGroup.
+	fallback *slogFallback
 }
 
-type slogHandlerState struct {
-	// initialized is set by OnServerInitialize. It also orders the reads of
-	// the connection after its assignment by the binder.
-	initialized atomic.Bool
-	// fallback receives the records that are not sent to the client.
-	fallback   io.Writer
-	fallbackMu sync.Mutex
+// slogFallback receives the records that are not sent to the client.
+type slogFallback struct {
+	mu sync.Mutex
+	w  io.Writer
 }
-
-var _ InitializeParticipant = (*SlogHandler)(nil)
 
 // SlogHandlerOptions are the options of a [SlogHandler].
 type SlogHandlerOptions struct {
@@ -79,7 +75,7 @@ func NewSlogHandlerWithOptions(sc *service.Container, options SlogHandlerOptions
 	if level == nil {
 		level = slog.LevelInfo
 	}
-	return &SlogHandler{sc: sc, level: level, state: &slogHandlerState{fallback: os.Stderr}}
+	return &SlogHandler{sc: sc, level: level, fallback: &slogFallback{w: os.Stderr}}
 }
 
 // SetDefaultLogger makes the [slog.Handler] registered in sc, by default a
@@ -91,22 +87,14 @@ func SetDefaultLogger(sc *service.Container) {
 	slog.SetDefault(slog.New(sc.MustGet[slog.Handler]()))
 }
 
-// OnServerInitialize implements [InitializeParticipant]: from now on, records
-// are sent to the client.
-func (h *SlogHandler) OnServerInitialize(_ *lsp.ParamInitialize) {
-	h.state.initialized.Store(true)
-}
-
 func (h *SlogHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= h.level.Level()
 }
 
 func (h *SlogHandler) Handle(ctx context.Context, record slog.Record) error {
 	msg := h.message(record)
-	if h.state.initialized.Load() {
-		if err := h.send(ctx, messageType(record.Level), msg); err == nil {
-			return nil
-		}
+	if err := h.send(ctx, messageType(record.Level), msg); err == nil {
+		return nil
 	}
 	return h.writeFallback(record, msg)
 }
@@ -193,16 +181,16 @@ func appendQuoted(buf []byte, s string) []byte {
 	return append(buf, s...)
 }
 
-var errNoConnection = errors.New("no connection to the client")
+var errNotInitialized = errors.New("the client has not initialized the server")
 
-// send sends msg to the client.
+// send sends msg to the client, once the client has initialized the server.
 func (h *SlogHandler) send(ctx context.Context, level lsp.MessageType, msg string) error {
 	conn, err := h.sc.Get[*Connection]()
 	if err != nil {
 		return err
 	}
-	if conn.Value == nil {
-		return errNoConnection
+	if !conn.Initialized() || conn.Value == nil {
+		return errNotInitialized
 	}
 	lspConn := lsp.ClientDispatcher(conn.Value)
 	return lspConn.LogMessage(ctx, &lsp.LogMessageParams{
@@ -218,8 +206,8 @@ func (h *SlogHandler) writeFallback(record slog.Record, msg string) error {
 	if !record.Time.IsZero() {
 		prefix = record.Time.Format("2006/01/02 15:04:05") + " " + prefix
 	}
-	h.state.fallbackMu.Lock()
-	defer h.state.fallbackMu.Unlock()
-	_, err := fmt.Fprintf(h.state.fallback, "%s %s\n", prefix, msg)
+	h.fallback.mu.Lock()
+	defer h.fallback.mu.Unlock()
+	_, err := fmt.Fprintf(h.fallback.w, "%s %s\n", prefix, msg)
 	return err
 }

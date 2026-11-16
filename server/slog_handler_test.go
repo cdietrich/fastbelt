@@ -50,23 +50,24 @@ func TestSlogHandlerLevel(t *testing.T) {
 	assert.True(t, debug.Enabled(ctx, slog.LevelDebug))
 }
 
-// Initializing a server does not change the process-wide default logger.
+// The handler does not take part in initializing a server, where it used to
+// make itself the process-wide default logger.
 func TestSlogHandlerIsNotTheDefaultLogger(t *testing.T) {
-	before := slog.Default()
-	NewSlogHandler(service.NewContainer()).(InitializeParticipant).OnServerInitialize(&lsp.ParamInitialize{})
-	assert.Same(t, before, slog.Default())
+	_, participates := NewSlogHandler(service.NewContainer()).(InitializeParticipant)
+	assert.False(t, participates)
 }
 
 // Until the client has initialized the server, and while there is no
 // connection, records are written to the fallback (stderr) instead of being
-// dropped; handlers derived with WithAttrs share that state.
+// dropped; handlers derived with WithAttrs share the fallback.
 func TestSlogHandlerFallsBackBeforeInitialize(t *testing.T) {
 	sc := service.NewContainer()
-	sc.Put(&Connection{})
+	connection := &Connection{}
+	sc.Put(connection)
 	sc.Seal()
 	h := NewSlogHandler(sc).(*SlogHandler)
 	var out bytes.Buffer
-	h.state.fallback = &out
+	h.fallback.w = &out
 	derived := h.WithAttrs([]slog.Attr{slog.String("server", "x")})
 
 	r := record("cannot start", slog.String("reason", "no port"))
@@ -75,7 +76,8 @@ func TestSlogHandlerFallsBackBeforeInitialize(t *testing.T) {
 
 	// Initialized, but without a connection: still the fallback.
 	out.Reset()
-	h.OnServerInitialize(&lsp.ParamInitialize{})
+	connection.initialized.Store(true)
+	assert.True(t, connection.Initialized())
 	r.Time = time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	require.NoError(t, derived.Handle(context.Background(), r))
 	assert.Equal(t, "2026/11/16 12:00:00 INFO cannot start server=x reason=\"no port\"\n", out.String())

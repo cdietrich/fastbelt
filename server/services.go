@@ -6,6 +6,7 @@ package server
 
 import (
 	"log/slog"
+	"sync/atomic"
 
 	"golang.org/x/exp/jsonrpc2"
 	"typefox.dev/fastbelt/util/service"
@@ -21,6 +22,16 @@ type WorkspaceFolders struct {
 // It is assigned by [DefaultBinder.Bind] when the language server is started.
 type Connection struct {
 	Value *jsonrpc2.Connection
+	// initialized is set by [DefaultLanguageServer.Initialize].
+	initialized atomic.Bool
+}
+
+// Initialized reports whether the client has sent the initialize request.
+// Before that, the server must not send messages to the client. Value is
+// only read after Initialized returned true, which orders the read after
+// its assignment by the binder.
+func (c *Connection) Initialized() bool {
+	return c.initialized.Load()
 }
 
 // SetupDefaultServices sets up the default services for the language server.
