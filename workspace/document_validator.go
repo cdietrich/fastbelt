@@ -33,11 +33,11 @@ func NewDefaultDocumentValidator(sc *service.Container) DocumentValidator {
 }
 
 func (s *DefaultDocumentValidator) Validate(ctx context.Context, doc *core.Document) []*core.Diagnostic {
-	if doc.Root == nil {
-		return nil
-	}
-
 	source := documentLanguageID(doc)
+	if doc.Root == nil {
+		// Not parsed (e.g. the parser failed): report the lexer and parser errors.
+		return append(CreateLexerDiagnostics(doc, source), CreateParserDiagnostics(doc, source)...)
+	}
 
 	lexerErrors := CreateLexerDiagnostics(doc, source)
 	parserErrors := CreateParserDiagnostics(doc, source)

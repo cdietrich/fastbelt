@@ -5,8 +5,10 @@
 package parallel
 
 import (
+	"fmt"
 	"iter"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -45,6 +47,11 @@ func ForEach[T any](elements []T, action func(T, int)) {
 // per worker goroutine and passes its result to every action call performed by
 // that worker. Use it to give each worker goroutine-local state.
 //
+// If an action panics on a worker goroutine, the remaining elements are
+// skipped and the first panic is raised again on the calling goroutine, as a
+// [*WorkerPanic], so that the caller can recover it; a panic on a worker
+// goroutine would otherwise end the process.
+//
 // When only one worker is needed (a single element, or GOMAXPROCS=1), setup and
 // action run on the calling goroutine.
 func ForEachWithSetup[T, S any](elements []T, setup func() S, action func(S, T, int)) {
@@ -67,8 +74,15 @@ func ForEachWithSetup[T, S any](elements []T, setup func() S, action func(S, T, 
 	// Store -1 so that the first Add(1) returns 0, the index of the first element.
 	next.Store(-1)
 	var wg sync.WaitGroup
+	var panicked atomic.Pointer[WorkerPanic]
 	for range workers {
 		wg.Go(func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panicked.CompareAndSwap(nil, &WorkerPanic{Value: r, Stack: debug.Stack()})
+					next.Store(int64(total)) // skip the remaining elements
+				}
+			}()
 			state := setup()
 			for {
 				i := int(next.Add(1))
@@ -80,4 +94,20 @@ func ForEachWithSetup[T, S any](elements []T, setup func() S, action func(S, T, 
 		})
 	}
 	wg.Wait()
+	if p := panicked.Load(); p != nil {
+		panic(p)
+	}
+}
+
+// WorkerPanic is the value [ForEach] and [ForEachWithSetup] panic with on
+// the calling goroutine when an action panicked on a worker goroutine.
+type WorkerPanic struct {
+	// Value is the value the action panicked with.
+	Value any
+	// Stack is the stack trace of the worker goroutine at the panic.
+	Stack []byte
+}
+
+func (p *WorkerPanic) String() string {
+	return fmt.Sprintf("%v\n\nworker goroutine stack:\n%s", p.Value, p.Stack)
 }

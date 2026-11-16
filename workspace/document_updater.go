@@ -7,6 +7,7 @@ package workspace
 import (
 	"context"
 	"log"
+	"runtime/debug"
 
 	core "typefox.dev/fastbelt"
 	"typefox.dev/fastbelt/textdoc"
@@ -102,6 +103,7 @@ func UpdateInLock(ctx context.Context, sc *service.Container, apply func(ctx con
 	lock := sc.MustGet[Lock]()
 	applied := make(chan struct{})
 	go lock.Write(ctx, func(writeCtx context.Context) {
+		defer RecoverWrite("workspace update")
 		changed, deleted, notify := func() ([]textdoc.Handle, []core.URI, func()) {
 			defer close(applied)
 			return apply(writeCtx)
@@ -164,4 +166,15 @@ func (s *DefaultDocumentChangeImpact) Affected(doc *core.Document, changedURIs c
 		}
 	}
 	return false
+}
+
+// RecoverWrite recovers a panic of a write task (what describes the task) and
+// logs it with its stack trace; defer it at the start of the task. A panic of
+// a write task runs on its own goroutine and would end the process. Recovered,
+// the task ends and releases the lock; the documents it did not build stay
+// incomplete, and the next write builds them.
+func RecoverWrite(what string) {
+	if r := recover(); r != nil {
+		log.Printf("panic in %s: %v\n%s", what, r, debug.Stack())
+	}
 }
