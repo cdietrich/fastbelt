@@ -26,6 +26,8 @@ func main() {
 
 	// StartLanguageServer blocks on the connection until it is closed, which
 	// keeps the WASM instance alive while the worker is running.
+	// Send the output of the log and slog packages to the client.
+	server.SetDefaultLogger(sc)
 	if err := server.StartLanguageServer(ctx, sc); err != nil {
 		// Logging goes to the worker console via the WASM runtime.
 		panic(err)
