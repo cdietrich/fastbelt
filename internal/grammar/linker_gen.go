@@ -10,7 +10,6 @@ import (
 
 	core "typefox.dev/fastbelt"
 	"typefox.dev/fastbelt/linking"
-	"typefox.dev/fastbelt/util/extiter"
 	"typefox.dev/fastbelt/util/service"
 )
 
@@ -382,10 +381,18 @@ func (sc *FastbeltSymbolContainer) ForType(t reflect.Type) core.SymbolSeq {
 	case TypeFor_AbstractTokenRule:
 		return slices.Values(sc.AbstractTokenRules)
 	case TypeFor_AbstractRule:
-		return extiter.Concat(
-			slices.Values(sc.AbstractTokenRules),
-			slices.Values(sc.AbstractRules),
-		)
+		return func(yield func(*core.SymbolDescription) bool) {
+			for _, desc := range sc.AbstractTokenRules {
+				if !yield(desc) {
+					return
+				}
+			}
+			for _, desc := range sc.AbstractRules {
+				if !yield(desc) {
+					return
+				}
+			}
+		}
 	}
 	return core.EmptySymbolSeq
 }
