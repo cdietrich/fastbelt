@@ -10,7 +10,6 @@ import (
 
 	core "typefox.dev/fastbelt"
 	"typefox.dev/fastbelt/linking"
-	"typefox.dev/fastbelt/util/extiter"
 	"typefox.dev/fastbelt/util/service"
 )
 
@@ -504,10 +503,18 @@ func (sc *CompletionSymbolContainer) Put(desc *core.SymbolDescription) bool {
 }
 
 func (sc *CompletionSymbolContainer) All() core.SymbolSeq {
-	return extiter.Concat(
-		slices.Values(sc.Leads),
-		slices.Values(sc.Declares),
-	)
+	return func(yield func(*core.SymbolDescription) bool) {
+		for _, desc := range sc.Leads {
+			if !yield(desc) {
+				return
+			}
+		}
+		for _, desc := range sc.Declares {
+			if !yield(desc) {
+				return
+			}
+		}
+	}
 }
 
 var TypeFor_Lead = reflect.TypeFor[Lead]()

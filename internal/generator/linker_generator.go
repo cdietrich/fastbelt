@@ -42,7 +42,6 @@ func GenerateLinker(grammr grammar.Grammar, packageName string) string {
 		n.AppendLine("core \"typefox.dev/fastbelt\"")
 		if len(context.fields) > 0 {
 			n.AppendLine("\"typefox.dev/fastbelt/linking\"")
-			n.AppendLine("\"typefox.dev/fastbelt/util/extiter\"")
 		}
 		n.AppendLine("\"typefox.dev/fastbelt/util/service\"")
 	})
@@ -244,13 +243,7 @@ func generateSymbolContainers(context *LinkerGeneratorContext) codegen.Node {
 		node.AppendLine("return core.EmptySymbolSeq")
 	} else {
 		node.Indent(func(n codegen.Node) {
-			n.AppendLine("return extiter.Concat(")
-			n.Indent(func(n2 codegen.Node) {
-				for _, target := range sortedTargets {
-					n2.AppendLine("slices.Values(sc.", target, "s),")
-				}
-			})
-			n.AppendLine(")")
+			appendSymbolLoops(n, sortedTargets)
 		})
 	}
 	node.AppendLine("}")
@@ -277,13 +270,9 @@ func generateSymbolContainers(context *LinkerGeneratorContext) codegen.Node {
 					n.AppendLine("    return slices.Values(sc.", target, "s)")
 				} else {
 					// Include this type's list and all descendant lists.
-					n.AppendLine("    return extiter.Concat(")
 					n.Indent(func(n2 codegen.Node) {
-						for _, sub := range subtypes {
-							n2.AppendLine("slices.Values(sc.", sub, "s),")
-						}
+						appendSymbolLoops(n2, subtypes)
 					})
-					n.AppendLine("    )")
 				}
 			}
 			n.AppendLine("}")
@@ -360,4 +349,22 @@ func generateReferenceConstructor(context *LinkerGeneratorContext) codegen.Node 
 		node.AppendLine("}").AppendLine()
 	}
 	return node
+}
+
+// appendSymbolLoops appends a return statement with a sequence over the
+// symbol container slices of targets, in order. It loops over the slices in a
+// single closure: chaining one iterator per slice would allocate a closure per
+// slice on every call.
+func appendSymbolLoops(n codegen.Node, targets []string) {
+	n.AppendLine("return func(yield func(*core.SymbolDescription) bool) {")
+	n.Indent(func(n2 codegen.Node) {
+		for _, target := range targets {
+			n2.AppendLine("for _, desc := range sc.", target, "s {")
+			n2.AppendLine("    if !yield(desc) {")
+			n2.AppendLine("        return")
+			n2.AppendLine("    }")
+			n2.AppendLine("}")
+		}
+	})
+	n.AppendLine("}")
 }

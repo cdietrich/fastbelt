@@ -10,7 +10,6 @@ import (
 
 	core "typefox.dev/fastbelt"
 	"typefox.dev/fastbelt/linking"
-	"typefox.dev/fastbelt/util/extiter"
 	"typefox.dev/fastbelt/util/service"
 )
 
@@ -168,11 +167,23 @@ func (sc *StatemachineModelSymbolContainer) Put(desc *core.SymbolDescription) bo
 }
 
 func (sc *StatemachineModelSymbolContainer) All() core.SymbolSeq {
-	return extiter.Concat(
-		slices.Values(sc.States),
-		slices.Values(sc.Events),
-		slices.Values(sc.Commands),
-	)
+	return func(yield func(*core.SymbolDescription) bool) {
+		for _, desc := range sc.States {
+			if !yield(desc) {
+				return
+			}
+		}
+		for _, desc := range sc.Events {
+			if !yield(desc) {
+				return
+			}
+		}
+		for _, desc := range sc.Commands {
+			if !yield(desc) {
+				return
+			}
+		}
+	}
 }
 
 var TypeFor_State = reflect.TypeFor[State]()

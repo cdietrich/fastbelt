@@ -10,7 +10,6 @@ import (
 
 	core "typefox.dev/fastbelt"
 	"typefox.dev/fastbelt/linking"
-	"typefox.dev/fastbelt/util/extiter"
 	"typefox.dev/fastbelt/util/service"
 )
 
@@ -100,9 +99,13 @@ func (sc *TokenModesSymbolContainer) Put(desc *core.SymbolDescription) bool {
 }
 
 func (sc *TokenModesSymbolContainer) All() core.SymbolSeq {
-	return extiter.Concat(
-		slices.Values(sc.VariableDecls),
-	)
+	return func(yield func(*core.SymbolDescription) bool) {
+		for _, desc := range sc.VariableDecls {
+			if !yield(desc) {
+				return
+			}
+		}
+	}
 }
 
 var TypeFor_VariableDecl = reflect.TypeFor[VariableDecl]()
