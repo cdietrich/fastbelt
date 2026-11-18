@@ -27,9 +27,12 @@ type Connection struct {
 }
 
 // Initialized reports whether the client has sent the initialize request.
-// Before that, the server must not send messages to the client, e.g. log
-// messages ([SlogHandler]). Read Value only after Initialized returned true,
-// which orders the read after its assignment by the binder.
+// From then on, the server may send the messages that the LSP specification
+// allows while the initialize request is pending: window/logMessage (as
+// [SlogHandler] does), window/showMessage, window/showMessageRequest and
+// telemetry/event. Other requests and notifications must wait until the
+// server has responded to initialize. Read Value only after Initialized
+// returned true, which orders the read after its assignment by the binder.
 func (c *Connection) Initialized() bool {
 	return c.initialized.Load()
 }
