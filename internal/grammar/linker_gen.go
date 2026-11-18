@@ -336,13 +336,33 @@ func (sc *FastbeltSymbolContainer) Put(desc *core.SymbolDescription) bool {
 }
 
 func (sc *FastbeltSymbolContainer) All() core.SymbolSeq {
-	return extiter.Concat(
-		slices.Values(sc.TokenModes),
-		slices.Values(sc.Interfaces),
-		slices.Values(sc.Fields),
-		slices.Values(sc.AbstractTokenRules),
-		slices.Values(sc.AbstractRules),
-	)
+	return func(yield func(*core.SymbolDescription) bool) {
+		for _, desc := range sc.TokenModes {
+			if !yield(desc) {
+				return
+			}
+		}
+		for _, desc := range sc.Interfaces {
+			if !yield(desc) {
+				return
+			}
+		}
+		for _, desc := range sc.Fields {
+			if !yield(desc) {
+				return
+			}
+		}
+		for _, desc := range sc.AbstractTokenRules {
+			if !yield(desc) {
+				return
+			}
+		}
+		for _, desc := range sc.AbstractRules {
+			if !yield(desc) {
+				return
+			}
+		}
+	}
 }
 
 var TypeFor_TokenMode = reflect.TypeFor[TokenMode]()

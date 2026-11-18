@@ -10,7 +10,6 @@ import (
 
 	core "typefox.dev/fastbelt"
 	"typefox.dev/fastbelt/linking"
-	"typefox.dev/fastbelt/util/extiter"
 	"typefox.dev/fastbelt/util/service"
 )
 
@@ -100,9 +99,13 @@ func (sc *MultilangModelSymbolContainer) Put(desc *core.SymbolDescription) bool 
 }
 
 func (sc *MultilangModelSymbolContainer) All() core.SymbolSeq {
-	return extiter.Concat(
-		slices.Values(sc.Greetings),
-	)
+	return func(yield func(*core.SymbolDescription) bool) {
+		for _, desc := range sc.Greetings {
+			if !yield(desc) {
+				return
+			}
+		}
+	}
 }
 
 var TypeFor_Greeting = reflect.TypeFor[Greeting]()

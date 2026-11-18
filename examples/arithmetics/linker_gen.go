@@ -10,7 +10,6 @@ import (
 
 	core "typefox.dev/fastbelt"
 	"typefox.dev/fastbelt/linking"
-	"typefox.dev/fastbelt/util/extiter"
 	"typefox.dev/fastbelt/util/service"
 )
 
@@ -100,9 +99,13 @@ func (sc *ArithmeticsSymbolContainer) Put(desc *core.SymbolDescription) bool {
 }
 
 func (sc *ArithmeticsSymbolContainer) All() core.SymbolSeq {
-	return extiter.Concat(
-		slices.Values(sc.AbstractDefinitions),
-	)
+	return func(yield func(*core.SymbolDescription) bool) {
+		for _, desc := range sc.AbstractDefinitions {
+			if !yield(desc) {
+				return
+			}
+		}
+	}
 }
 
 var TypeFor_AbstractDefinition = reflect.TypeFor[AbstractDefinition]()

@@ -151,6 +151,28 @@ func BenchmarkSymbolContainerForType(b *testing.B) {
 	}
 }
 
+// BenchmarkSymbolContainerAll measures iterating all symbols of a container,
+// as code does that walks the symbols of every document in a workspace.
+func BenchmarkSymbolContainerAll(b *testing.B) {
+	doc, ref := setupLinkedStatemachine(b)
+	root := ref.Owner()
+	for root.Container() != nil {
+		root = root.Container()
+	}
+	container := doc.LocalSymbols.For(root)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		count := 0
+		for range container.All() {
+			count++
+		}
+		if count == 0 {
+			b.Fatal("no symbols")
+		}
+	}
+}
+
 // BenchmarkIsEmptyOverContainer measures extiter.IsEmpty on a container-backed
 // sequence — the check LocalScopeOfType performs at every ancestor level.
 func BenchmarkIsEmptyOverContainer(b *testing.B) {

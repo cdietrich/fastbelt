@@ -42,6 +42,8 @@ func GenerateLinker(grammr grammar.Grammar, packageName string) string {
 		n.AppendLine("core \"typefox.dev/fastbelt\"")
 		if len(context.fields) > 0 {
 			n.AppendLine("\"typefox.dev/fastbelt/linking\"")
+		}
+		if symbolContainerMergesTypes(context) {
 			n.AppendLine("\"typefox.dev/fastbelt/util/extiter\"")
 		}
 		n.AppendLine("\"typefox.dev/fastbelt/util/service\"")
@@ -184,7 +186,9 @@ func subtypesInTargets(t string, uniqueTargets []string, ifaceParents map[string
 	return result
 }
 
-func generateSymbolContainers(context *LinkerGeneratorContext) codegen.Node {
+// symbolContainerTargets returns the reference target types that get a slice
+// in the generated symbol container, children before parents.
+func symbolContainerTargets(context *LinkerGeneratorContext) []string {
 	seen := map[string]bool{}
 	uniqueTargets := []string{}
 	for _, field := range context.fields {
@@ -196,7 +200,23 @@ func generateSymbolContainers(context *LinkerGeneratorContext) codegen.Node {
 	// Sort alphabetically to make output deterministic; topoSort will reorder as needed.
 	sort.Strings(uniqueTargets)
 	// Sort so children appear before parents in the Put type switch.
-	sortedTargets := topoSort(uniqueTargets, context.ifaceParents, true)
+	return topoSort(uniqueTargets, context.ifaceParents, true)
+}
+
+// symbolContainerMergesTypes reports whether ForType of the generated symbol
+// container concatenates the slices of a target type and its subtypes.
+func symbolContainerMergesTypes(context *LinkerGeneratorContext) bool {
+	targets := symbolContainerTargets(context)
+	for _, target := range targets {
+		if len(subtypesInTargets(target, targets, context.ifaceParents)) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func generateSymbolContainers(context *LinkerGeneratorContext) codegen.Node {
+	sortedTargets := symbolContainerTargets(context)
 
 	name := context.grammar.Name()
 	node := codegen.NewNode()
@@ -239,18 +259,24 @@ func generateSymbolContainers(context *LinkerGeneratorContext) codegen.Node {
 	node.AppendLine("}")
 	node.AppendLine()
 
+	// All loops over the slices in a single closure: chaining one iterator per
+	// slice would allocate a closure per slice on every call.
 	node.AppendLine("func (sc *", name, "SymbolContainer) All() core.SymbolSeq {")
 	if len(sortedTargets) == 0 {
 		node.AppendLine("return core.EmptySymbolSeq")
 	} else {
 		node.Indent(func(n codegen.Node) {
-			n.AppendLine("return extiter.Concat(")
+			n.AppendLine("return func(yield func(*core.SymbolDescription) bool) {")
 			n.Indent(func(n2 codegen.Node) {
 				for _, target := range sortedTargets {
-					n2.AppendLine("slices.Values(sc.", target, "s),")
+					n2.AppendLine("for _, desc := range sc.", target, "s {")
+					n2.AppendLine("    if !yield(desc) {")
+					n2.AppendLine("        return")
+					n2.AppendLine("    }")
+					n2.AppendLine("}")
 				}
 			})
-			n.AppendLine(")")
+			n.AppendLine("}")
 		})
 	}
 	node.AppendLine("}")
